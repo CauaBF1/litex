@@ -338,11 +338,20 @@ class TestSoCBusHandler(unittest.TestCase):
 
     def test_address_width_conversion_between_bus_standards(self):
         wishbone_bus = SoCBusHandler(standard="wishbone", data_width=32, address_width=32)
+        wishbone_byte_bus = SoCBusHandler(
+            standard      = "wishbone",
+            data_width    = 32,
+            address_width = 32,
+            addressing    = "byte",
+        )
         axi_bus      = SoCBusHandler(standard="axi",      data_width=64, address_width=32)
 
         self.assertEqual(wishbone_bus.get_address_width("wishbone"), 32)
         self.assertEqual(wishbone_bus.get_address_width("axi-lite"), 34)
         self.assertEqual(wishbone_bus.get_address_width("axi"),      34)
+        self.assertEqual(wishbone_byte_bus.get_address_width("wishbone"), 30)
+        self.assertEqual(wishbone_byte_bus.get_address_width("wishbone", addressing="byte"), 32)
+        self.assertEqual(wishbone_byte_bus.get_address_width("axi"), 32)
         self.assertEqual(axi_bus.get_address_width("axi"),           32)
         self.assertEqual(axi_bus.get_address_width("wishbone"),      29)
 
@@ -434,6 +443,23 @@ class TestSoCBusHandler(unittest.TestCase):
         self.assertIsNone(bus.check_regions_overlap(regions))
         self.assertEqual(bus.check_regions_overlap(regions, check_linker=True), ("boot", "linker"))
 
+    def test_overlapping_slave_regions_reject_linker_overlay(self):
+        bus = SoCBusHandler()
+        bus.add_slave("ram", wishbone.Interface(), SoCRegion(
+            origin = 0x00000000,
+            size   = 0x1000,
+        ))
+
+        with _assert_raises_soc_error(self):
+            bus.add_slave("alias", wishbone.Interface(), SoCRegion(
+                origin = 0x00000000,
+                size   = 0x1000,
+                linker = True,
+            ))
+
+        self.assertNotIn("alias", bus.slaves)
+        self.assertNotIn("alias", bus.regions)
+
     def test_auto_allocation_avoids_existing_linker_regions(self):
         bus = SoCBusHandler()
         bus.add_region("io", SoCIORegion(origin=0x80000000, size=0x10000))
@@ -462,11 +488,39 @@ class TestSoCBusHandler(unittest.TestCase):
         self.assertTrue(bus.check_region_is_io(SoCRegion(origin=0x80000f00, size=0x100, cached=False)))
         self.assertFalse(bus.check_region_is_io(SoCRegion(origin=0x80001000, size=0x100, cached=False)))
 
+    def test_io_containment_accounts_for_rounded_decode_size(self):
+        bus = SoCBusHandler()
+        bus.add_region("io", SoCIORegion(origin=0x80000000, size=0x1800))
+
+        with _assert_raises_soc_error(self):
+            bus.add_region("device", SoCRegion(
+                origin = 0x80000000,
+                size   = 0x1800,
+                cached = False,
+            ))
+
+        self.assertNotIn("device", bus.regions)
+
     def test_io_region_overlap_uses_exact_size(self):
         bus = SoCBusHandler()
 
         bus.add_region("io",       SoCIORegion(origin=0x1200_0000, size=0x6e00_0000))
         bus.add_region("main_ram", SoCRegion(  origin=0x8000_0000, size=0x2000_0000))
+
+    def test_io_region_can_extend_beyond_bus_address_width(self):
+        bus = SoCBusHandler(address_width=32)
+
+        bus.add_region("io", SoCIORegion(origin=0xe000_0000, size=0xff_2000_0000))
+
+        self.assertIn("io", bus.io_regions)
+
+    def test_bus_region_must_fit_bus_address_width(self):
+        bus = SoCBusHandler(address_width=32)
+
+        with _assert_raises_soc_error(self):
+            bus.add_region("too_high", SoCRegion(origin=0xf000_0000, size=0x2000_0000))
+
+        self.assertNotIn("too_high", bus.regions)
 
     def test_partial_io_region_overlap_is_rejected(self):
         bus = SoCBusHandler()
@@ -785,6 +839,35 @@ class TestSoCBusStandardIntegration(unittest.TestCase):
         self.assertEqual(list(bus.masters.keys()), ["master0", "master1"])
         self.assertEqual(list(bus.slaves.keys()),  ["slave0",  "slave1"])
 
+    def test_partial_zero_origin_region_keeps_address_decoder(self):
+        bus    = SoCBusHandler(timeout=8)
+        master = wishbone.Interface()
+        slave  = wishbone.Interface()
+        bus.add_master("master", master)
+        bus.add_slave("slave", slave, SoCRegion(origin=0x00000000, size=0x1000))
+        bus.finalize()
+
+        def generator():
+            yield master.adr.eq(0x1000 // 4)
+            yield master.cyc.eq(1)
+            yield master.stb.eq(1)
+            yield
+            self.assertEqual((yield slave.cyc), 0)
+
+        run_simulation(bus, generator())
+
+    def test_full_address_region_keeps_configured_timeout(self):
+        bus = SoCBusHandler(timeout=8)
+        bus.add_master("master", wishbone.Interface())
+        bus.add_slave("slave", wishbone.Interface(), SoCRegion(
+            origin = 0x00000000,
+            size   = 2**bus.address_width,
+        ))
+
+        bus.finalize()
+
+        self.assertTrue(hasattr(bus._interconnect, "timeout"))
+
     def test_slave_can_use_predeclared_region(self):
         bus = SoCBusHandler()
         bus.add_region("ram", SoCRegion(origin=0x00000000, size=0x1000))
@@ -904,6 +987,14 @@ class TestSoCCSRHandler(unittest.TestCase):
 
 
 class TestSoCIRQHandler(unittest.TestCase):
+    def test_irq_handler_rejects_invalid_irq_counts(self):
+        for n_irqs in [-1, 1.5, True]:
+            with self.subTest(n_irqs=n_irqs):
+                with _assert_raises_soc_error(self):
+                    SoCIRQHandler(n_irqs=n_irqs)
+
+        self.assertEqual(SoCIRQHandler(n_irqs=0).n_locs, 0)
+
     def test_irq_handler_requires_enable_before_add(self):
         irq = SoCIRQHandler(n_irqs=4)
 
@@ -1253,6 +1344,37 @@ class TestSoC(unittest.TestCase):
         with _assert_raises_soc_error(self):
             soc.add_spi_flash()
 
+    def test_spi_flash_exports_erase_geometry(self):
+        from litespi.ids import SpiNorFlashManufacturerIDs
+        from litespi.opcodes import SpiNorFlashOpCodes as Codes
+        from litespi.phy.model import LiteSPIPHYModel
+        from litespi.spi_nor_flash_module import SpiNorFlashModule
+
+        class EraseGeometryModule(SpiNorFlashModule):
+            manufacturer_id = SpiNorFlashManufacturerIDs.NONJEDEC
+            device_id       = 0x1234
+            name            = "erase-geometry"
+            total_size      = 256
+            page_size       = 256
+            total_pages     = 1
+            supported_opcodes = [Codes.READ_1_1_1, Codes.PP_1_1_1]
+            dummy_bits = 0
+
+        module = EraseGeometryModule(Codes.READ_1_1_1)
+        # Set the attributes directly to keep this test compatible with LiteSPI releases that
+        # predate erase descriptors while exercising LiteX's constant generation.
+        module.erase_opcode    = Codes.BE_4K_4B
+        module.erase_size      = 4 * 1024
+        module.erase_addr_bits = 32
+        phy = LiteSPIPHYModel(module, init=[0])
+        soc = LiteXSoC(_FakePlatform(), sys_clk_freq=1e6)
+        soc.cpu = SimpleNamespace(endianness="little")
+        soc.add_spi_flash(mode="1x", module=module, phy=phy, with_master=True)
+
+        self.assertEqual(soc.constants["SPIFLASH_MODULE_ERASE_OPCODE"], Codes.BE_4K_4B.code)
+        self.assertEqual(soc.constants["SPIFLASH_MODULE_ERASE_SIZE"], 4 * 1024)
+        self.assertEqual(soc.constants["SPIFLASH_MODULE_ERASE_ADDR_BITS"], 32)
+
     def test_spi_ram_requires_module(self):
         soc = LiteXSoC(_FakePlatform(), sys_clk_freq=1e6)
 
@@ -1308,6 +1430,17 @@ class TestSoC(unittest.TestCase):
 
         with _assert_raises_soc_error(self):
             soc.add_uartbone(baudrate=0)
+
+    def test_spi_master_rejects_invalid_clock_before_core_creation(self):
+        for spi_clk_freq in [0, -1]:
+            with self.subTest(spi_clk_freq=spi_clk_freq):
+                soc  = LiteXSoC(_FakePlatform(), sys_clk_freq=1e6)
+                pads = Record([("clk", 1), ("cs_n", 1), ("mosi", 1), ("miso", 1)])
+
+                with _assert_raises_soc_error(self):
+                    soc.add_spi_master(pads=pads, spi_clk_freq=spi_clk_freq)
+
+                self.assertFalse(hasattr(soc, "spimaster"))
 
     def test_spi_sdcard_rejects_invalid_clock_before_imports(self):
         soc = LiteXSoC(_FakePlatform(), sys_clk_freq=1e6)
