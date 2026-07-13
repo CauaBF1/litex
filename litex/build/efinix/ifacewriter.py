@@ -603,7 +603,6 @@ design.create("{2}", "{3}", "./", overwrite=True)
         return '\n'.join(cmd) + '\n'
 
     def generate_remote_update(self, block, verbose=True):
-        name = block["name"]
         pins = block["pins"]
         clock = block["clock"]
         invert_clk = block["invert_clock"]
