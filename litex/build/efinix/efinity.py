@@ -384,7 +384,7 @@ class EfinityToolchain(GenericToolchain):
         et.SubElement(design_info, "efx:top_module", name=self._build_name)
 
         # Add Design Sources.
-        for filename, language, library, *copy in self.platform.sources:
+        for filename, language, library, *_ in self.platform.sources:
             if language is None:
                 continue
             et.SubElement(design_info, "efx:design_file", {
