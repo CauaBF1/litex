@@ -25,9 +25,10 @@ class AnlogicPlatform(GenericPlatform):
         else:
             raise ValueError(f"Unknown toolchain {toolchain}")
 
-    def get_verilog(self, *args, special_overrides=dict(), **kwargs):
+    def get_verilog(self, *args, special_overrides=None, **kwargs):
         so = dict(common.anlogic_special_overrides)
-        so.update(special_overrides)
+        if special_overrides is not None:
+            so.update(special_overrides)
         return GenericPlatform.get_verilog(self, *args,
             special_overrides = so,
             attr_translate    = self.toolchain.attr_translate,
